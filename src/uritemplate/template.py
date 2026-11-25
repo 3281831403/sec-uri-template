@@ -9,24 +9,30 @@ from urllib.parse import urlsplit
 _UNRESERVED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
-_RESERVED = frozenset(":/?#!$&'()*+,;=")
+# RFC 3986 reserved characters: gen-delims and sub-delims.
+_RESERVED = frozenset(":/?#[]@!$&'()*+,;=")
 
 _OPERATORS = ("+", "#", ".", "/", ";", "?", "&")
-_PREFIX = {"": "", "+": "", "#": "", ".": ".", "/": "/", ";": ";", "?": "?", "&": "&"}
+_PREFIX = {"": "", "+": "", "#": "#", ".": ".", "/": "/", ";": ";", "?": "?", "&": "&"}
 _SEPARATOR = {"": ",", "+": ",", "#": ",", ".": ".", "/": "/", ";": ";", "?": "&", "&": "&"}
 _NAMED = frozenset({";", "?", "&"})
+# Operators whose values may keep reserved characters unencoded.
+_RESERVED_STYLE = frozenset({"+", "#"})
 
 _STYLES = ("simple", "reserved", "label", "path", "query")
 _VARNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _encode(text: str, keep_reserved: bool) -> str:
+    """Percent-encode ``text`` as UTF-8, uppercasing each escape.
+
+    A space is always encoded as ``%20`` (never ``+``).  Only unreserved
+    characters survive, plus reserved characters when ``keep_reserved`` is set.
+    """
     out: List[str] = []
     for byte in text.encode("utf-8"):
         char = chr(byte)
-        if char == " ":
-            out.append("+")
-        elif char in _UNRESERVED or (keep_reserved and char in _RESERVED):
+        if char in _UNRESERVED or (keep_reserved and char in _RESERVED):
             out.append(char)
         else:
             out.append("%%%02X" % byte)
@@ -34,7 +40,11 @@ def _encode(text: str, keep_reserved: bool) -> str:
 
 
 def encode_value(value: str, style: str) -> str:
-    """Percent-encode ``value`` for the given expansion style."""
+    """Percent-encode ``value`` for the given expansion style.
+
+    ``simple``/``label``/``path``/``query`` encode everything but unreserved
+    characters; ``reserved`` additionally keeps RFC 3986 reserved characters.
+    """
     if style not in _STYLES:
         raise ValueError("unsupported encoding style: %r" % (style,))
     return _encode(str(value), style == "reserved")
@@ -45,12 +55,16 @@ def _parse_expression(body: str) -> Dict[str, object]:
     if body[:1] in _OPERATORS:
         operator = body[0]
         body = body[1:]
+    if not body:
+        raise ValueError("empty-expression")
     variables: List[Dict[str, object]] = []
     for raw in body.split(","):
         raw = raw.strip()
         explode = raw.endswith("*")
         if explode:
             raw = raw[:-1]
+        if not _VARNAME_RE.match(raw):
+            raise ValueError("invalid-varname")
         variables.append({"name": raw, "explode": explode})
     return {"operator": operator, "variables": variables}
 
@@ -67,9 +81,7 @@ def parse(template: str) -> List[object]:
         if char == "{":
             close = template.find("}", index + 1)
             if close < 0:
-                literal.append(char)
-                index += 1
-                continue
+                raise ValueError("unclosed-expression")
             if literal:
                 segments.append("".join(literal))
                 literal = []
@@ -86,7 +98,7 @@ def parse(template: str) -> List[object]:
 
 
 def validate(template: str) -> List[str]:
-    """Return the list of problems found in ``template``."""
+    """Return the list of problems found in ``template`` (empty when valid)."""
     try:
         parse(template)
     except ValueError as exc:
@@ -99,25 +111,27 @@ def _render(operator: str, name: str, value: object, explode: bool) -> List[str]
     is_list = isinstance(value, (list, tuple))
     items = [str(item) for item in value] if is_list else [str(value)]
     named = operator in _NAMED
-    keep_reserved = False
-    if is_list:
-        if not items:
-            return []
-        encoded = [_encode(item, keep_reserved) for item in items]
-        if explode:
-            if named and operator in ("?", "&"):
-                return ["%s=%s" % (name, ",".join(encoded))]
-            if not named:
-                return [",".join(encoded)]
-            return ["%s=%s" % (name, item) for item in encoded]
-        joined = ",".join(encoded)
-        if named:
-            return ["%s=%s" % (name, joined)]
-        return [joined]
-    encoded = _encode(items[0], keep_reserved)
+    keep_reserved = operator in _RESERVED_STYLE
+
+    if is_list and not items:
+        # An empty list contributes nothing at all.
+        return []
+
+    encoded = [_encode(item, keep_reserved) for item in items]
+
+    if is_list and explode:
+        chunks: List[str] = []
+        for item in encoded:
+            if named:
+                chunks.append("%s=%s" % (name, item) if item else name)
+            else:
+                chunks.append(item)
+        return chunks
+
+    joined = ",".join(encoded)
     if named:
-        return ["%s=%s" % (name, encoded)]
-    return [encoded]
+        return ["%s=%s" % (name, joined) if joined else name]
+    return [joined]
 
 
 def _expand_expression(
@@ -157,11 +171,14 @@ def expand_safe(
     """Expand and reject anything that is not a plain allowed http(s) URL."""
     url = expand(template, variables)
     parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("unsupported scheme: %r" % (parts.scheme,))
     if "@" in parts.netloc:
         raise ValueError("userinfo is not allowed")
     host = parts.hostname
     if not host:
-        return url
+        raise ValueError("missing host")
     allowed = {str(item).strip().lower().rstrip(".") for item in allow_hosts}
     if host.lower().rstrip(".") not in allowed:
         raise ValueError("host is not allowed: %r" % (host,))
